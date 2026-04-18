@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUNTIME_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=/dev/null
+source "$RUNTIME_DIR/scripts/env.sh"
+
+exec java --enable-native-access=ALL-UNNAMED \
+  -jar "$RUNTIME_DIR/examples/jvm/benchmark_deploy.jar" \
+  "$LITERT_DEFAULT_MODEL" \
+  "$@"

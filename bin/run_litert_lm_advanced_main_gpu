@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUNTIME_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=/dev/null
+source "$RUNTIME_DIR/scripts/env.sh"
+
+exec "$RUNTIME_DIR/bin/litert_lm_advanced_main" \
+  --model_path="$LITERT_DEFAULT_MODEL" \
+  --backend=gpu \
+  --multi_turns=true \
+  "$@"
