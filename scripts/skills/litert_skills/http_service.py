@@ -7,7 +7,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
-from .agent import AgentConfig, LiteRTSkillAgent, SkillRegistry
+from .agent import AgentConfig, LiteRTCliError, LiteRTProtocolError, LiteRTSkillAgent, SkillRegistry
 
 
 def _json_bytes(payload: object) -> bytes:
@@ -303,6 +303,10 @@ class LiteRTSkillRequestHandler(BaseHTTPRequestHandler):
                     elapsed_seconds=elapsed_seconds,
                     error=str(exc),
                 )
+                if isinstance(exc, LiteRTProtocolError):
+                    break
+                if not isinstance(exc, LiteRTCliError):
+                    break
 
         assert last_error is not None
         raise last_error

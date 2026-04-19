@@ -177,25 +177,6 @@ def _handle_live_event(event: dict[str, Any]) -> None:
             flush=True,
         )
         return
-    if event_type == "json_format_corrected":
-        corrected_json = str(event.get("corrected_json") or "").strip()
-        print("[动作] JSON 格式检查器已自动修正输出", flush=True)
-        if corrected_json:
-            print("[修正后的技能链 JSON]", flush=True)
-            print(corrected_json, flush=True)
-        return
-    if event_type == "protocol_retry":
-        reason = str(event.get("validation_error") or "输出格式不符合技能链要求")
-        print(
-            f"[动作] 技能链规划不合格，正在进行第 {event.get('retry_count', '?')} 次纠错重试"
-            f"：{reason}",
-            flush=True,
-        )
-        raw_response = str(event.get("raw_response") or "").strip()
-        if raw_response:
-            print("[模型原始输出]", flush=True)
-            print(raw_response, flush=True)
-        return
     if event_type == "invalid_model_output":
         reason = str(event.get("validation_error") or "模型输出不符合要求")
         print(f"[警告] 检测到不合格的模型输出：{reason}", flush=True)

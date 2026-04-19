@@ -14,9 +14,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from .json_checker import RobotSkillJsonCheckResult, check_and_repair_robot_skill_plan
-
-
 PROMPT_MARKER = "Please enter the prompt (or press Enter to end): "
 LINE_SEPARATOR = "\u2028"
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
@@ -35,6 +32,10 @@ _LOG_PATTERNS = (
 
 class LiteRTCliError(RuntimeError):
     """Raised when the wrapped LiteRT CLI fails."""
+
+
+class LiteRTProtocolError(RuntimeError):
+    """Raised when the model output violates the planning protocol."""
 
 
 @dataclass(frozen=True)
@@ -478,146 +479,93 @@ class LiteRTSkillAgent:
         requirements = _extract_robot_chain_requirements(task_data)
 
         run_started_at = time.time()
-        steps_limit = max_steps or self._config.max_steps
         prompt = self._build_robot_chain_prompt(task_data)
-        raw_responses: list[str] = []
-        planned_skill_calls: list[dict[str, Any]] = []
-        skill_results: list[dict[str, Any]] = []
-        step_traces: list[dict[str, Any]] = []
-        llm_inference_count = 0
-        llm_inference_seconds = 0.0
-        skill_execution_seconds = 0.0
-        protocol_retry_count = 0
+        _emit_progress(
+            progress_callback,
+            event="inference_started",
+            step=1,
+            prompt_reason="initial_task",
+        )
 
-        for step_index in range(steps_limit):
-            prompt_reason = "initial_task" if step_index == 0 else "protocol_retry"
+        inference_started_at = time.time()
+        response = self._cli.ask(prompt)
+        inference_elapsed = round(time.time() - inference_started_at, 6)
+        parsed_plan = _parse_robot_skill_plan_json(response)
+        response_type = "skill_plan" if parsed_plan is not None else "invalid"
+        _emit_progress(
+            progress_callback,
+            event="inference_completed",
+            step=1,
+            prompt_reason="initial_task",
+            inference_seconds=inference_elapsed,
+            response_type=response_type,
+        )
+
+        if verbose:
+            print("\n[model-step-1]")
+            print(response)
+
+        step_trace: dict[str, Any] = {
+            "step": 1,
+            "prompt_reason": "initial_task",
+            "inference_seconds": inference_elapsed,
+            "response_type": response_type,
+        }
+
+        validation_error = _robot_chain_output_error(parsed_plan)
+        canonical_plan: list[dict[str, Any]] = []
+        normalized_plan: list[dict[str, Any]] = []
+        if validation_error is None and parsed_plan is not None:
+            canonical_plan, validation_error = self._canonicalize_skill_calls(parsed_plan)
+        if validation_error is None:
+            normalized_plan = _normalize_robot_chain_skill_calls(requirements, canonical_plan)
+            validation_error = _validate_robot_chain_skill_calls(requirements, normalized_plan)
+
+        if validation_error is not None:
+            step_trace["validation_error"] = validation_error
             _emit_progress(
                 progress_callback,
-                event="inference_started",
-                step=step_index + 1,
-                prompt_reason=prompt_reason,
+                event="invalid_model_output",
+                step=1,
+                validation_error=validation_error,
+                raw_response=response,
             )
+            raise LiteRTProtocolError(validation_error)
 
-            inference_started_at = time.time()
-            response = self._cli.ask(prompt)
-            inference_elapsed = round(time.time() - inference_started_at, 6)
-            llm_inference_count += 1
-            llm_inference_seconds += inference_elapsed
-            raw_responses.append(response)
+        planned_skill_calls = normalized_plan
+        step_trace["planned_skill_count"] = len(planned_skill_calls)
+        _emit_progress(
+            progress_callback,
+            event="skill_plan_ready",
+            step=1,
+            planned_skill_count=len(planned_skill_calls),
+            planned_skill_calls=planned_skill_calls,
+        )
 
-            thinking = _extract_robot_thinking_block(response)
-            plan_check = _parse_robot_skill_plan_block(response)
-            parsed_plan = plan_check.calls
-            if parsed_plan is None:
-                response_type = "invalid"
-            elif plan_check.corrected:
-                response_type = "skill_plan_corrected"
-            else:
-                response_type = "skill_plan"
-            _emit_progress(
-                progress_callback,
-                event="inference_completed",
-                step=step_index + 1,
-                prompt_reason=prompt_reason,
-                inference_seconds=inference_elapsed,
-                response_type=response_type,
-            )
+        skill_results, skill_execution_seconds = self._execute_plan(
+            planned_skill_calls,
+            progress_callback=progress_callback,
+        )
 
-            step_trace: dict[str, Any] = {
-                "step": step_index + 1,
-                "prompt_reason": prompt_reason,
-                "inference_seconds": inference_elapsed,
-                "response_type": response_type,
-            }
-            if plan_check.corrected and plan_check.corrected_json is not None:
-                step_trace["corrected_json"] = plan_check.corrected_json
-            step_traces.append(step_trace)
-
-            if verbose:
-                print(f"\n[model-step-{step_index + 1}]")
-                print(response)
-
-            if plan_check.corrected and plan_check.corrected_json is not None:
-                _emit_progress(
-                    progress_callback,
-                    event="json_format_corrected",
-                    step=step_index + 1,
-                    corrected_json=plan_check.corrected_json,
-                )
-
-            validation_error = _robot_chain_output_error(thinking, parsed_plan)
-            canonical_plan: list[dict[str, Any]] = []
-            normalized_plan: list[dict[str, Any]] = []
-            if validation_error is None and parsed_plan is not None:
-                canonical_plan, validation_error = self._canonicalize_skill_calls(parsed_plan)
-            if validation_error is None:
-                normalized_plan = _normalize_robot_chain_skill_calls(requirements, canonical_plan)
-                validation_error = _validate_robot_chain_skill_calls(requirements, normalized_plan)
-
-            if validation_error is not None:
-                step_trace["validation_error"] = validation_error
-                _emit_progress(
-                    progress_callback,
-                    event="invalid_model_output",
-                    step=step_index + 1,
-                    validation_error=validation_error,
-                    raw_response=response,
-                )
-                if step_index + 1 < steps_limit:
-                    protocol_retry_count += 1
-                    _emit_progress(
-                        progress_callback,
-                        event="protocol_retry",
-                        step=step_index + 1,
-                        retry_count=protocol_retry_count,
-                        validation_error=validation_error,
-                        raw_response=response,
-                    )
-                    prompt = self._build_robot_chain_retry_prompt(
-                        task_data,
-                        response,
-                        validation_error=validation_error,
-                    )
-                    continue
-                raise RuntimeError(validation_error)
-
-            planned_skill_calls = normalized_plan
-            step_trace["planned_skill_count"] = len(planned_skill_calls)
-            _emit_progress(
-                progress_callback,
-                event="skill_plan_ready",
-                step=step_index + 1,
-                planned_skill_count=len(planned_skill_calls),
-                planned_skill_calls=planned_skill_calls,
-            )
-
-            executed_results, execution_elapsed = self._execute_plan(
-                planned_skill_calls,
-                progress_callback=progress_callback,
-            )
-            skill_results.extend(executed_results)
-            skill_execution_seconds += execution_elapsed
-
-            return RunOutcome(
-                task=task,
-                final_message=_fast_final_message_from_skill_results(executed_results),
-                raw_responses=raw_responses,
-                planned_skill_calls=planned_skill_calls,
-                skill_results=skill_results,
-                stats={
-                    "llm_inference_count": llm_inference_count,
-                    "llm_inference_seconds": round(llm_inference_seconds, 6),
-                    "planned_skill_count": len(planned_skill_calls),
-                    "skill_execution_count": len(skill_results),
-                    "skill_execution_seconds": round(skill_execution_seconds, 6),
-                    "protocol_retry_count": protocol_retry_count,
-                    "dispatch_mode": "robot_chain_planner",
-                    "end_to_end_seconds": round(time.time() - run_started_at, 6),
-                    "step_traces": step_traces,
-                },
-            )
-
-        raise RuntimeError(f"Exceeded max_steps={steps_limit} before producing a valid robot skill plan.")
+        return RunOutcome(
+            task=task,
+            final_message=_fast_final_message_from_skill_results(skill_results),
+            raw_responses=[response],
+            planned_skill_calls=planned_skill_calls,
+            skill_results=skill_results,
+            stats={
+                "llm_inference_count": 1,
+                "llm_inference_seconds": inference_elapsed,
+                "planned_skill_count": len(planned_skill_calls),
+                "skill_execution_count": len(skill_results),
+                "skill_execution_seconds": round(skill_execution_seconds, 6),
+                "protocol_retry_count": 0,
+                "dispatch_mode": "robot_chain_planner",
+                "end_to_end_seconds": round(time.time() - run_started_at, 6),
+                "step_traces": [step_trace],
+                "max_steps_requested": max_steps or self._config.max_steps,
+            },
+        )
 
     def _canonicalize_skill_calls(
         self,
@@ -689,26 +637,6 @@ class LiteRTSkillAgent:
             TASK_INSTRUCTION=task_data.instruction,
         )
 
-    def _build_robot_chain_retry_prompt(
-        self,
-        task_data: RobotChainTaskData,
-        last_response: str,
-        *,
-        validation_error: str,
-    ) -> str:
-        return _render_prompt_template(
-            "robot_retry_prompt.md",
-            ROLE_MD=_read_prompt_template("robot_role.md"),
-            OUTPUT_CONTRACT_MD=_read_prompt_template("robot_output_contract.md"),
-            REGISTERED_SKILLS_MD=_render_registered_skills_markdown(self._registry),
-            TASK_NAME=task_data.name or "robot_chain_task",
-            TASK_DESCRIPTION=task_data.description,
-            TASK_PARAMETERS_JSON=json.dumps(task_data.parameters, ensure_ascii=False, indent=2),
-            TASK_INSTRUCTION=task_data.instruction,
-            VALIDATION_ERROR=validation_error,
-            LAST_RESPONSE=last_response,
-        )
-
 
 def _annotation_name(annotation: Any) -> str:
     if annotation is inspect._empty:
@@ -733,20 +661,17 @@ def _render_prompt_template(filename: str, **values: str) -> str:
 def _render_registered_skills_markdown(registry: SkillRegistry) -> str:
     lines = ["## Registered Skills", ""]
     for skill in registry.prompt_catalog():
-        lines.append(f"### {skill['name']}")
-        lines.append(f"- description: {skill['description']}")
-        if skill.get("aliases"):
-            lines.append(f"- aliases: {', '.join(str(alias) for alias in skill['aliases'])}")
+        lines.append(f"- {skill['name']}: {skill['description']}")
         parameters = skill.get("parameters") or []
         if parameters:
-            lines.append("- parameters:")
+            lines.append("  parameters:")
             for parameter in parameters:
                 requirement = "required" if parameter.get("required", True) else "optional"
                 lines.append(
                     f"  - {parameter['name']}: {parameter['type']} ({requirement})"
                 )
         else:
-            lines.append("- parameters: none")
+            lines.append("  parameters: none")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -834,50 +759,60 @@ def _extract_robot_chain_requirements(task_data: RobotChainTaskData) -> RobotCha
     )
 
 
-def _extract_robot_thinking_block(text: str) -> str | None:
-    match = re.search(
-        r"<robot_thinking>\s*(.*?)\s*</robot_thinking>",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if not match:
+def _parse_robot_skill_plan_json(text: str) -> list[dict[str, Any]] | None:
+    stripped = text.strip()
+    if not stripped:
         return None
-    content = match.group(1).strip()
-    return content or None
 
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
 
-def _parse_robot_skill_plan_block(text: str) -> RobotSkillJsonCheckResult:
-    match = re.search(
-        r"<robot_skill_plan>\s*(.*?)\s*</robot_skill_plan>",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if not match:
-        return RobotSkillJsonCheckResult(
-            calls=None,
-            corrected_json=None,
-            corrected=False,
-            error="Missing <robot_skill_plan> block.",
+    if not isinstance(parsed, dict):
+        return None
+    if set(parsed.keys()) != {"skills"}:
+        return None
+
+    skills = parsed.get("skills")
+    if not isinstance(skills, list) or not skills:
+        return None
+
+    parsed_calls: list[dict[str, Any]] = []
+    for item in skills:
+        if not isinstance(item, dict):
+            return None
+        if set(item.keys()) - {"skill", "args", "parameters"}:
+            return None
+        skill_name = item.get("skill")
+        if not isinstance(skill_name, str) or not skill_name.strip():
+            return None
+        arguments = item.get("args")
+        parameters = item.get("parameters")
+        if arguments is not None and parameters is not None:
+            return None
+        if arguments is None:
+            arguments = parameters
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            return None
+        parsed_calls.append(
+            {
+                "skill_name": skill_name.strip(),
+                "arguments": dict(arguments),
+            }
         )
-    body = match.group(1).strip()
-    if not body:
-        return RobotSkillJsonCheckResult(
-            calls=None,
-            corrected_json=None,
-            corrected=False,
-            error="Empty <robot_skill_plan> block.",
-        )
-    return check_and_repair_robot_skill_plan(body)
+
+    return parsed_calls
 
 
-def _robot_chain_output_error(
-    thinking: str | None,
-    parsed_plan: list[dict[str, Any]] | None,
-) -> str | None:
-    if thinking is None:
-        return "Robot chain mode requires a <robot_thinking> block before the final plan."
+def _robot_chain_output_error(parsed_plan: list[dict[str, Any]] | None) -> str | None:
     if parsed_plan is None:
-        return "Robot chain mode requires a valid <robot_skill_plan> block containing valid JSON."
+        return (
+            "Robot chain mode requires exactly one valid JSON object with top-level key "
+            "'skills', for example: {\"skills\":[{\"skill\":\"get_env\"}]}"
+        )
     return None
 
 
